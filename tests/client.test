@@ -1,0 +1,97 @@
+package require tcltest
+package require pure-tcl-oauth2-client
+namespace import ::tcltest::test
+namespace eval ::provider {
+    variable key [::tink::register_keyset [::tink::jwt::create_private_keyset RS256_2048_F4]]
+    variable nonce {}; variable verifier {}; variable calls 0; variable tamper {}; variable now 1000
+    proc clock {} {variable now; return $now}
+    proc transport {method url fields headers} {
+        variable key; variable nonce; variable verifier; variable calls; variable tamper
+        incr calls
+        set body {}
+        if {[string match */jwks $url]} {set body [::tink::jwt::export_jwks $key]} elseif {[string match */token $url]} {
+            if {[dict get $fields grant_type] eq "authorization_code"} {set verifier [dict get $fields code_verifier]}
+            set claims [dict create iss {S https://provider.example} sub {S user} aud {S client} iat {N 1000} exp {N 1300} nonce [list S $nonce] email_verified {BOOL 1}]
+            if {$tamper eq "nonce"} {dict set claims nonce {S wrong}}
+            if {$tamper eq "audience"} {dict set claims aud {S wrong}}
+            set id [::tink::jwt::sign $key [list M $claims]]
+            set body [::oauth2::core::encode_json [dict create access_token {S access} token_type {S Bearer} expires_in {N 300} id_token [list S $id]]]
+        } else {error "unexpected provider endpoint"}
+        dict create status 200 headers {cache-control max-age=3600} body [encoding convertto utf-8 $body]
+    }
+}
+set store [::oauth2::store::memory]
+set client [::oauth2::client::create -issuer https://provider.example -client_id client -client_secret secret \
+    -redirect_uri https://client.example/callback -transaction_store $store -clock ::provider::clock -transport ::provider::transport \
+    -metadata {{"issuer":"https://provider.example","authorization_endpoint":"https://provider.example/auth","token_endpoint":"https://provider.example/token","jwks_uri":"https://provider.example/jwks"}}]
+test client-login {complete code flow verifies PKCE and a signed ID token} -body {
+    set start [$client start -browser_session browser -return_to /account]
+    set params [::oauth2::core::form_decode [lindex [split [dict get $start authorization_url] ?] 1]]
+    set ::provider::nonce [dict get $params nonce]
+    set result [$client callback [dict create state [dict get $start state] code code] -browser_session browser]
+    list [dict get $result subject] [dict get $result return_to] \
+        [expr {[::oauth2::core::pkce_challenge $::provider::verifier] eq [dict get $params code_challenge]}] \
+        [catch {$client callback [dict create state [dict get $start state] code code] -browser_session browser}]
+} -result {user /account 1 1}
+test client-session {wrong browser cannot consume another browser's login transaction} -body {
+    set start [$client start -browser_session browser]
+    set params [::oauth2::core::form_decode [lindex [split [dict get $start authorization_url] ?] 1]]
+    set ::provider::nonce [dict get $params nonce]
+    set callback [dict create state [dict get $start state] code code]
+    list [catch {$client callback $callback -browser_session other}] [dict get [$client callback $callback -browser_session browser] subject]
+} -result {1 user}
+test client-token-policy {signed tokens with incorrect nonce or audience cannot log in} -body {
+    set result {}
+    foreach ::provider::tamper {nonce audience} {
+        set start [$client start -browser_session browser]
+        lappend result [catch {$client callback [dict create state [dict get $start state] code code] -browser_session browser}]
+    }
+    set ::provider::tamper {}
+    set result
+} -result {1 1}
+test client-key-rotation {a new kid refreshes cached JWKS before its cache expiry} -body {
+    set old $::provider::key
+    set ::provider::key [::tink::register_keyset [::tink::jwt::create_private_keyset RS256_2048_F4]]
+    set ::provider::now 1031
+    set start [$client start -browser_session browser]
+    set params [::oauth2::core::form_decode [lindex [split [dict get $start authorization_url] ?] 1]]
+    set ::provider::nonce [dict get $params nonce]
+    set result [$client callback [dict create state [dict get $start state] code code] -browser_session browser]
+    ::tink::unregister_keyset $old
+    dict get $result subject
+} -result user
+test client-durable {two workers share sealed SQL state and enforce one callback} -body {
+    package require tpersist
+    set filename [::tcltest::makeFile {} shared-client.sqlite]
+    set db [::tpersist::db_connect -database $filename -autobegin 0]
+    ::oauth2::store::initdb $db
+    set db2 [::tpersist::db_connect -database $filename -autobegin 0]
+    set first [::oauth2::store::sql $db client-test]
+    set second [::oauth2::store::sql $db2 client-test]
+    set encryption [::tink::register_keyset [::tink::aead::create_keyset AES256_GCM]]
+    set options [set [info object namespace $client]::config]
+    dict set options -transaction_store $first
+    dict set options -aead $encryption
+    set a [::oauth2::client::create {*}$options]
+    dict set options -transaction_store $second
+    set b [::oauth2::client::create {*}$options]
+    try {
+        set start [$a start -browser_session browser]
+        set params [::oauth2::core::form_decode [lindex [split [dict get $start authorization_url] ?] 1]]
+        set ::provider::nonce [dict get $params nonce]
+        set stored [$first get client_transaction [::oauth2::core::digest [dict get $start state]] 1031]
+        set fields [dict create state [dict get $start state] code code]
+        list [dict get $stored data sealed] [expr {[string first $::provider::nonce $stored] < 0}] \
+            [dict get [$b callback $fields -browser_session browser] subject] \
+            [catch {$a callback $fields -browser_session browser}]
+    } finally {
+        $a destroy; $b destroy; $first destroy; $second destroy
+        ::tink::unregister_keyset $encryption
+        ::tpersist::db_disconnect $db2
+        ::tpersist::db_disconnect $db
+        ::tcltest::removeFile $filename
+    }
+} -result {true 1 user 1}
+$client destroy
+$store destroy
+::tink::unregister_keyset $::provider::key
