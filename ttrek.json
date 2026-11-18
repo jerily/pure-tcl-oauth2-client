@@ -1,0 +1,15 @@
+{
+  "name": "pure-tcl-oauth2-client",
+  "version": "0.1.0",
+  "license": "MIT",
+  "dependencies": {
+    "tcl": ">=9.1.0,<10.0.0",
+    "pure-tcl-oauth2-core": "^0.1.0",
+    "trequests": "^1.3.0"
+  },
+  "devDependencies": {
+    "tpersist": "^0.1.5"
+  },
+  "description": "OAuth2 and OpenID Connect clients for Tcl, including Google Login.",
+  "url": "https://github.com/jerily/pure-tcl-oauth2-client"
+}
